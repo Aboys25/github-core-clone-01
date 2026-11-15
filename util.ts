@@ -70,3 +70,43 @@ export function parseIdentity(line: string): { name: string; email: string; time
 export function formatIdentity(name: string, email: string, timestamp: number): string {
   return `${name} <${email}> ${timestamp} +0000`;
 }
+
+/**
+ * git check-ref-format subset for full ref names ("refs/heads/x"). Rejects
+ * control characters (including newlines — a stored name reaches the raw
+ * protocol advertisement verbatim), spaces, ~ ^ : ? * [ \, "..", "@{",
+ * leading/trailing slashes, empty components, components starting with ".",
+ * and components ending with ".lock". A name with no slash is not a ref.
+ */
+export function isValidRefName(name: string): boolean {
+  if (name === '' || name === '@') return false;
+  if (!name.includes('/')) return false;
+  if (name.startsWith('/') || name.endsWith('/') || name.endsWith('.')) return false;
+  if (name.includes('..') || name.includes('@{')) return false;
+  for (let i = 0; i < name.length; i += 1) {
+    const code = name.charCodeAt(i);
+    if (code <= 0x20 || code === 0x7f) return false;
+    const ch = name[i];
+    if (ch === '~' || ch === '^' || ch === ':' || ch === '?' || ch === '*' || ch === '[' || ch === '\\') return false;
+  }
+  for (const component of name.split('/')) {
+    if (component === '' || component.startsWith('.') || component.endsWith('.lock')) return false;
+  }
+  return true;
+}
+
+/** A short branch name is valid when refs/heads/<name> is a valid ref name. */
+export function isValidBranchName(name: string): boolean {
+  return name !== '' && isValidRefName(`refs/heads/${name}`);
+}
+
+/** Repository names: the rule REST has always enforced, shared with MCP. */
+export function isValidRepoName(name: string): boolean {
+  return /^[A-Za-z0-9._-]+$/.test(name);
+}
+
+/** Format a unix-seconds commit timestamp as RFC 3339; out-of-range values fall back to the epoch. */
+export function formatCommitDate(timestamp: number): string {
+  const date = new Date(timestamp * 1000);
+  return Number.isNaN(date.getTime()) ? '1970-01-01T00:00:00.000Z' : date.toISOString();
+}

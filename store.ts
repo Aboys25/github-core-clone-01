@@ -64,6 +64,7 @@ export interface PullRec {
   readonly baseShaAtCreate: string | null;
   mergedAt: string | null;
   mergeCommitSha: string | null;
+  readonly comments: CommentRec[];
   readonly createdAt: string;
   updatedAt: string;
   closedAt: string | null;
@@ -287,6 +288,7 @@ export function createPullRecord(
     baseShaAtCreate: repo.refs.get(`refs/heads/${opts.baseRef}`) ?? null,
     mergedAt: null,
     mergeCommitSha: null,
+    comments: [],
     createdAt: opts.nowIso,
     updatedAt: opts.nowIso,
     closedAt: null,
@@ -334,7 +336,8 @@ export function pullMergeable(repo: RepoRec, pull: PullRec): 'MERGEABLE' | 'CONF
   const headFlat = flattenTree(parseCommit(repo.objects.get(headCommit)!.data).tree, lookup);
   const oursFlat = flattenTree(parseCommit(repo.objects.get(baseCommit)!.data).tree, lookup);
   const baseFlat = base ? flattenTree(parseCommit(repo.objects.get(base)!.data).tree, lookup) : new Map<string, FlatEntry>();
-  const { conflicts } = threeWayMerge(baseFlat, oursFlat, headFlat);
+  // Read-only check: hash merged blobs without storing them.
+  const { conflicts } = threeWayMerge(baseFlat, oursFlat, headFlat, { lookup, put: (type, data) => hashObject(type, data) });
   return conflicts.length ? 'CONFLICTING' : 'MERGEABLE';
 }
 
@@ -355,7 +358,7 @@ export function mergePullRecord(repo: RepoRec, pull: PullRec, id: ForgeIdentity)
   const headFlat = flattenTree(parseCommit(repo.objects.get(headCommit)!.data).tree, lookup);
   const oursFlat = flattenTree(parseCommit(repo.objects.get(baseCommit)!.data).tree, lookup);
   const baseFlat = base ? flattenTree(parseCommit(repo.objects.get(base)!.data).tree, lookup) : new Map<string, FlatEntry>();
-  const { merged, conflicts } = threeWayMerge(baseFlat, oursFlat, headFlat);
+  const { merged, conflicts } = threeWayMerge(baseFlat, oursFlat, headFlat, { lookup, put: (type, data) => putObject(repo, type, data) });
   if (!merged) throw new DomainError(405, `Merge conflict in: ${conflicts.join(', ')}`);
   const treeOid = buildTreeFromMap(merged, (type, data) => putObject(repo, type, data));
   const { commitOid } = commitOnBranch(repo, pull.baseRef, treeOid, `${pull.title} (#${pull.number})`, id);

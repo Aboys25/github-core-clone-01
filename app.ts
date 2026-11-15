@@ -8,6 +8,7 @@
  * buffered whole and answered with Content-Length so keep-alive stays cheap.
  */
 
+import { timingSafeEqual } from 'node:crypto';
 import { createServer } from 'node:http';
 import type { IncomingMessage, Server, ServerResponse } from 'node:http';
 import { handleInfoRefs, handleReceivePack, handleUploadPack } from './gitHttp.ts';
@@ -57,21 +58,38 @@ function sendBuffer(res: ServerResponse, status: number, contentType: string, bo
   res.end(body);
 }
 
+/** Rejects when a body exceeds MAX_BODY_BYTES; the catch-all answers 413 for it. */
+class BodyTooLargeError extends Error {
+  constructor() {
+    super('request body too large');
+  }
+}
+
 function readBody(req: IncomingMessage): Promise<Buffer> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
     let length = 0;
+    let settled = false;
     req.on('data', (chunk: Buffer) => {
+      if (settled) return;
       length += chunk.length;
       if (length > MAX_BODY_BYTES) {
-        reject(new Error('request body too large'));
-        req.destroy();
+        settled = true;
+        reject(new BodyTooLargeError());
         return;
       }
       chunks.push(chunk);
     });
-    req.on('end', () => resolve(Buffer.concat(chunks)));
-    req.on('error', reject);
+    req.on('end', () => {
+      if (settled) return;
+      settled = true;
+      resolve(Buffer.concat(chunks));
+    });
+    req.on('error', (err) => {
+      if (settled) return;
+      settled = true;
+      reject(err);
+    });
   });
 }
 
@@ -81,7 +99,9 @@ function checkAuth(req: IncomingMessage, expectedToken: string | null): boolean 
   const match = /^(?:Bearer|token)\s+(\S+)$/i.exec(header.trim());
   if (!match) return false;
   if (expectedToken === null) return match[1].length > 0;
-  return match[1] === expectedToken;
+  const given = Buffer.from(match[1], 'utf8');
+  const expected = Buffer.from(expectedToken, 'utf8');
+  return given.length === expected.length && timingSafeEqual(given, expected);
 }
 
 interface RouteInfo {
@@ -255,10 +275,30 @@ export function createApp(config: AppConfig): App {
 
         sendJson(res, 404, { message: 'Not Found' });
       } catch (err) {
-        // Never crash, never HTML: a 500 JSON keeps the suite (and the trial) alive.
+        // Never crash, never HTML, never leak internals: a generic 500 JSON
+        // keeps the suite (and the trial) alive; the detail goes to stderr only.
         try {
-          if (!res.headersSent) sendJson(res, 500, { message: err instanceof Error ? err.message : 'Internal error' });
-          else res.end();
+          process.stderr.write(`git-forge error: ${err instanceof Error ? err.message : String(err)}\n`);
+        } catch {
+          /* stderr gone */
+        }
+        try {
+          if (!res.headersSent) {
+            if (err instanceof BodyTooLargeError) {
+              sendJson(res, 413, { message: 'Request body too large' });
+              // Stop the upload only once the 413 has flushed, so the client
+              // actually sees the status instead of a dropped connection.
+              res.on('finish', () => {
+                try {
+                  req.destroy();
+                } catch {
+                  /* socket already gone */
+                }
+              });
+            } else {
+              sendJson(res, 500, { message: 'Internal error' });
+            }
+          } else res.end();
         } catch {
           try {
             res.end();

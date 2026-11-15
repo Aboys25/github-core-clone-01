@@ -81,7 +81,7 @@ async function main(): Promise<void> {
       server.once('error', reject);
       server.listen(port, '127.0.0.1', () => resolve());
     });
-    process.stderr.write(`git-forge dev server on http://127.0.0.1:${port} (token: ${shopToken ?? 'any non-empty bearer'})\n`);
+    process.stderr.write(`git-forge dev server on http://127.0.0.1:${port} (token: ${shopToken ? 'set' : 'any non-empty bearer'})\n`);
     const shutdown = (): void => {
       server.close(() => process.exit(0));
     };

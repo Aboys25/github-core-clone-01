@@ -11,8 +11,10 @@ import {
   buildTreeFromMap,
   isObjectId,
   listCommits,
+  mergeBase,
   parseCommit,
   parseTree,
+  peelToCommit,
 } from './git.ts';
 import type { FlatEntry } from './git.ts';
 import {
@@ -31,7 +33,7 @@ import {
   resolveToCommit,
 } from './store.ts';
 import type { IssueRec, Label, PullRec, RepoRec } from './store.ts';
-import { globalId, isRecord, parseIdentity, stringField } from './util.ts';
+import { formatCommitDate, globalId, isRecord, isValidBranchName, isValidRefName, isValidRepoName, parseIdentity, stringField } from './util.ts';
 import type { ForgeContext } from './app-types.ts';
 
 export interface RestRequest {
@@ -189,8 +191,8 @@ function commitObject(ctx: ForgeContext, repo: RepoRec, oid: string): Record<str
     sha: oid,
     node_id: globalId('Commit', repo.dbId, oid),
     commit: {
-      author: { name: author.name, email: author.email, date: new Date(author.timestamp * 1000).toISOString() },
-      committer: { name: committer.name, email: committer.email, date: new Date(committer.timestamp * 1000).toISOString() },
+      author: { name: author.name, email: author.email, date: formatCommitDate(author.timestamp) },
+      committer: { name: committer.name, email: committer.email, date: formatCommitDate(committer.timestamp) },
       message,
       tree: { sha: commit.tree, url: `https://api.github.com/repos/${repo.owner}/${repo.name}/git/trees/${commit.tree}` },
       url: `https://api.github.com/repos/${repo.owner}/${repo.name}/git/commits/${oid}`,
@@ -208,6 +210,20 @@ function commitObject(ctx: ForgeContext, repo: RepoRec, oid: string): Record<str
       html_url: `https://github.com/${repo.owner}/${repo.name}/commit/${sha}`,
     })),
   };
+}
+
+/** Commits reachable from the live head tip but not from the merge base (0 when a tip is missing). */
+function pullCommitCount(repo: RepoRec, pull: PullRec): number {
+  const lookup = lookupOf(repo);
+  const headSha = liveHeadSha(repo, pull);
+  const baseSha = liveBaseSha(repo, pull);
+  if (!headSha || !baseSha) return 0;
+  const headCommit = peelToCommit(headSha, lookup);
+  const baseCommit = peelToCommit(baseSha, lookup);
+  if (!headCommit || !baseCommit) return 0;
+  const base = mergeBase(headCommit, baseCommit, lookup);
+  const baseReachable = new Set(base ? listCommits(base, lookup).map((entry) => entry.oid) : []);
+  return listCommits(headCommit, lookup).filter((entry) => !baseReachable.has(entry.oid)).length;
 }
 
 function pullObject(ctx: ForgeContext, repo: RepoRec, pull: PullRec): Record<string, unknown> {
@@ -270,10 +286,10 @@ function pullObject(ctx: ForgeContext, repo: RepoRec, pull: PullRec): Record<str
     rebaseable: mergeable === 'MERGEABLE',
     mergeable_state: mergeable === 'MERGEABLE' ? 'clean' : mergeable === 'CONFLICTING' ? 'dirty' : 'unknown',
     merged_by: pull.merged ? userObject(ctx) : null,
-    comments: 0,
+    comments: pull.comments.length,
     review_comments: 0,
     maintainer_can_modify: false,
-    commits: 0,
+    commits: pullCommitCount(repo, pull),
     additions,
     deletions,
     changed_files: files.length,
@@ -442,11 +458,13 @@ function handleUser(ctx: ForgeContext, req: RestRequest, rest: string[]): RestRe
       const body = req.body ?? {};
       const name = stringField(body, 'name');
       if (!name) return err(422, 'name is required');
-      if (!/^[A-Za-z0-9._-]+$/.test(name)) return err(422, 'name is invalid');
+      if (!isValidRepoName(name)) return err(422, 'name is invalid');
+      const defaultBranch = typeof body.default_branch === 'string' && body.default_branch ? body.default_branch : 'main';
+      if (!isValidBranchName(defaultBranch)) return err(422, 'default_branch is invalid');
       const repo = ctx.store.createRepo(ctx.viewer.login, name, {
         description: typeof body.description === 'string' ? body.description : null,
         isPrivate: body.private === true,
-        defaultBranch: typeof body.default_branch === 'string' && body.default_branch ? body.default_branch : 'main',
+        defaultBranch,
         nowIso: ctx.nowIso,
       });
       if (!repo) return err(422, `Repository ${ctx.viewer.login}/${name} already exists`);
@@ -470,7 +488,10 @@ function handleRepos(ctx: ForgeContext, req: RestRequest, rest: string[]): RestR
       if (!repo) return NOT_FOUND();
       const body = req.body ?? {};
       if (typeof body.description === 'string' || body.description === null) repo.description = body.description;
-      if (typeof body.default_branch === 'string' && body.default_branch) repo.defaultBranch = body.default_branch;
+      if (typeof body.default_branch === 'string' && body.default_branch) {
+        if (!isValidBranchName(body.default_branch)) return err(422, 'default_branch is invalid');
+        repo.defaultBranch = body.default_branch;
+      }
       if (typeof body.private === 'boolean') repo.isPrivate = body.private;
       repo.updatedAt = ctx.nowIso;
       return ok(repoObject(ctx, repo));
@@ -572,8 +593,17 @@ function handleGitRefs(ctx: ForgeContext, req: RestRequest, repo: RepoRec, rest:
     const ref = stringField(body, 'ref');
     const sha = stringField(body, 'sha');
     if (!ref.startsWith('refs/') || !isObjectId(sha)) return err(422, 'ref and sha are required');
+    if (!isValidRefName(ref)) return err(422, 'ref is invalid');
     if (!repo.objects.has(sha)) return err(422, 'sha does not exist');
     if (repo.refs.has(ref)) return err(422, 'ref already exists');
+    for (const existing of repo.refs.keys()) {
+      if (existing.startsWith(`${ref}/`) || ref.startsWith(`${existing}/`)) {
+        return err(422, 'ref conflicts with an existing ref');
+      }
+    }
+    if (ref.startsWith('refs/heads/') && !peelToCommit(sha, lookupOf(repo))) {
+      return err(422, 'branch must point at a commit');
+    }
     repo.refs.set(ref, sha);
     repo.updatedAt = ctx.nowIso;
     return ok({ ref, node_id: globalId('Ref', repo.dbId, ref), url: `https://api.github.com/repos/${repo.owner}/${repo.name}/git/refs/${ref.slice(5)}`, object: { sha, type: repo.objects.get(sha)!.type, url: `https://api.github.com/repos/${repo.owner}/${repo.name}/git/${repo.objects.get(sha)!.type}s/${sha}` } }, 201);
@@ -604,8 +634,12 @@ function handleGitRefs(ctx: ForgeContext, req: RestRequest, repo: RepoRec, rest:
     const wanted = `refs/${refRest.join('/')}`;
     const body = req.body ?? {};
     const sha = stringField(body, 'sha');
+    if (!isValidRefName(wanted)) return err(422, 'ref is invalid');
     if (!isObjectId(sha) || !repo.objects.has(sha)) return err(422, 'sha does not exist');
     if (!repo.refs.has(wanted)) return NOT_FOUND();
+    if (wanted.startsWith('refs/heads/') && !peelToCommit(sha, lookupOf(repo))) {
+      return err(422, 'branch must point at a commit');
+    }
     repo.refs.set(wanted, sha);
     repo.updatedAt = ctx.nowIso;
     return ok({ ref: wanted, node_id: globalId('Ref', repo.dbId, wanted), url: '', object: { sha, type: repo.objects.get(sha)!.type, url: '' } });
@@ -678,19 +712,28 @@ function handleContents(ctx: ForgeContext, req: RestRequest, repo: RepoRec, rest
     const body = req.body ?? {};
     const contentRaw = typeof body.content === 'string' ? body.content : null;
     if (contentRaw === null) return err(422, 'content is required');
-    let content: Buffer;
-    try {
-      content = Buffer.from(contentRaw.replace(/\s+/g, ''), 'base64');
-    } catch {
+    const stripped = contentRaw.replace(/\s+/g, '');
+    // Buffer.from(x, 'base64') never throws — it silently drops bad characters —
+    // so validate the canonical shape first (empty content is a 0-byte file).
+    if (!/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(stripped)) {
       return err(422, 'content is not valid base64');
     }
+    const content = Buffer.from(stripped, 'base64');
     const message = stringField(body, 'message', `Update ${path}`);
     const branch = stringField(body, 'branch', repo.defaultBranch) || repo.defaultBranch;
+    if (!isValidBranchName(branch)) return err(422, 'branch is invalid');
     const givenSha = typeof body.sha === 'string' ? body.sha : null;
     const flat = flatAtBranch(repo, branch);
     const existing = flat.get(path);
     if (existing && !givenSha) return err(409, 'sha is required to update an existing file');
     if (existing && givenSha && givenSha !== existing.oid) return err(409, 'sha does not match the current file');
+    if (!existing) {
+      for (const key of flat.keys()) {
+        if (key.startsWith(`${path}/`) || path.startsWith(`${key}/`)) {
+          return err(422, 'path conflicts with an existing file or directory');
+        }
+      }
+    }
     const blobOid = putObject(repo, 'blob', content);
     flat.set(path, { oid: blobOid, mode: existing?.mode ?? '100644' });
     const treeOid = buildTreeFromMap(flat, (type, data) => putObject(repo, type, data));
@@ -710,11 +753,13 @@ function handleContents(ctx: ForgeContext, req: RestRequest, repo: RepoRec, rest
     const body = req.body ?? {};
     const message = stringField(body, 'message', `Delete ${path}`);
     const branch = stringField(body, 'branch', repo.defaultBranch) || repo.defaultBranch;
+    if (!isValidBranchName(branch)) return err(422, 'branch is invalid');
     const givenSha = typeof body.sha === 'string' ? body.sha : null;
     const flat = flatAtBranch(repo, branch);
     const existing = flat.get(path);
     if (!existing) return NOT_FOUND();
-    if (givenSha && givenSha !== existing.oid) return err(409, 'sha does not match the current file');
+    if (!givenSha) return err(409, 'sha is required to delete a file');
+    if (givenSha !== existing.oid) return err(409, 'sha does not match the current file');
     flat.delete(path);
     const treeOid = buildTreeFromMap(flat, (type, data) => putObject(repo, type, data));
     const { commitOid } = commitOnBranch(repo, branch, treeOid, message, ctx);

@@ -10,7 +10,6 @@
 import {
   ZERO_OID,
   collectReachable,
-  hashObject,
   isAncestor,
   isObjectId,
   parseCommit,
@@ -19,7 +18,6 @@ import {
   parseTree,
   peelTags,
   peelToCommit,
-  pktDelim,
   pktFlush,
   pktLine,
   readPack,
@@ -28,7 +26,7 @@ import {
 } from './git.ts';
 import type { GitObject, Packet } from './git.ts';
 import { GitError } from './git.ts';
-import { lookupOf, putObject } from './store.ts';
+import { lookupOf } from './store.ts';
 import type { RepoRec } from './store.ts';
 import type { ForgeContext } from './app-types.ts';
 
@@ -251,7 +249,7 @@ function planFetch(
   const extraRoots: string[] = [];
   for (const want of wants) {
     const object = lookup(want);
-    if (!object) continue;
+    if (!object) throw new GitError(`want ${want} is not in the repository`, 'fetch-unknown-want');
     if (object.type === 'tag') {
       wantTags.push(want);
       const peeled = peelToCommit(want, lookup);
@@ -691,9 +689,4 @@ export function handleReceivePack(
   const report = Buffer.concat(reportParts);
   const bodyOut = Buffer.concat([...sidebandPackets(1, report), pktFlush()]);
   return ok(RECEIVE_RESULT_CT, bodyOut);
-}
-
-/** Re-exported for tests: the object id git would assign (kept here for symmetry). */
-export function objectIdOf(type: 'commit' | 'tree' | 'blob' | 'tag', data: Buffer): string {
-  return hashObject(type, data);
 }

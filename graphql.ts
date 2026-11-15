@@ -7,7 +7,7 @@
  */
 
 import { DomainError, createIssueRecord, createPullRecord, mergePullRecord, pullDiff, pullMergeable } from './store.ts';
-import type { IssueRec, PullRec, RepoRec } from './store.ts';
+import type { CommentRec, IssueRec, PullRec, RepoRec } from './store.ts';
 import { globalId, isRecord, parseGlobalId } from './util.ts';
 import type { ForgeContext } from './app-types.ts';
 
@@ -393,6 +393,7 @@ class Parser {
 
 const FIELDS: Record<string, string[]> = {
   Query: ['viewer', 'repository', 'node', '__type', '__schema'],
+  Mutation: ['createIssue', 'closeIssue', 'createPullRequest', 'mergePullRequest', 'addComment'],
   User: ['id', 'databaseId', 'login', 'name', 'email', 'url'],
   Repository: ['id', 'databaseId', 'name', 'nameWithOwner', 'owner', 'description', 'defaultBranchRef', 'viewerPermission', 'hasIssuesEnabled', 'isPrivate', 'url', 'createdAt', 'updatedAt', 'issue', 'issues', 'pullRequest', 'pullRequests'],
   Ref: ['name', 'target'],
@@ -637,6 +638,7 @@ function executeSelectionSet(
   object: GqlObject,
   selections: SelectionNode[],
   path: Array<string | number>,
+  seenSpreads: Set<string> = new Set(),
 ): Record<string, unknown> {
   const out: Record<string, unknown> = {};
   for (const selection of selections) {
@@ -645,13 +647,18 @@ function executeSelectionSet(
       if (!fragment) continue;
       if (directivesSkip(selection.directives, exec.variables)) continue;
       if (!typeMatches(typename, fragment.typeCondition)) continue;
-      Object.assign(out, executeSelectionSet(exec, typename, object, fragment.selectionSet, path));
+      // Cyclic fragments (A spreads B spreads A) must not recurse forever:
+      // a spread already expanded on this path is skipped. Field descent gets
+      // a fresh copy, so the same fragment still expands under other fields.
+      if (seenSpreads.has(selection.name)) continue;
+      seenSpreads.add(selection.name);
+      Object.assign(out, executeSelectionSet(exec, typename, object, fragment.selectionSet, path, seenSpreads));
       continue;
     }
     if (selection.kind === 'inline') {
       if (directivesSkip(selection.directives, exec.variables)) continue;
       if (selection.typeCondition && !typeMatches(typename, selection.typeCondition)) continue;
-      Object.assign(out, executeSelectionSet(exec, typename, object, selection.selectionSet, path));
+      Object.assign(out, executeSelectionSet(exec, typename, object, selection.selectionSet, path, seenSpreads));
       continue;
     }
     const field = selection;
@@ -677,12 +684,12 @@ function executeSelectionSet(
         const itemType = RETURN_TYPES[typename]?.[field.name] ?? typename;
         out[key] = value.map((item, index) =>
           item !== null && typeof item === 'object'
-            ? executeSelectionSet(exec, (item as GqlObject).__typename ?? itemType, item as GqlObject, field.selectionSet!, [...fieldPath, index])
+            ? executeSelectionSet(exec, (item as GqlObject).__typename ?? itemType, item as GqlObject, field.selectionSet!, [...fieldPath, index], new Set(seenSpreads))
             : item,
         );
       } else if (typeof value === 'object') {
         const itemType = (value as GqlObject).__typename ?? RETURN_TYPES[typename]?.[field.name] ?? typename;
-        out[key] = executeSelectionSet(exec, itemType, value as GqlObject, field.selectionSet, fieldPath);
+        out[key] = executeSelectionSet(exec, itemType, value as GqlObject, field.selectionSet, fieldPath, new Set(seenSpreads));
       } else {
         out[key] = value;
       }
@@ -745,7 +752,7 @@ function decodeNode(ctx: ForgeContext, id: unknown): GqlObject | null {
     const pull = repo?.pulls.get(Number(parsed.parts[1]));
     return repo && pull ? pullObj(repo, pull) : null;
   }
-  if (parsed.kind === 'User') return userObj(ctx);
+  if (parsed.kind === 'User') return Number(parsed.parts[0]) === ctx.viewer.id ? userObj(ctx) : null;
   return null;
 }
 
@@ -1117,7 +1124,10 @@ function resolveField(exec: ExecContext, typename: string, object: GqlObject, fi
       if (field.name === 'queryType') return { __typename: '__Type', typeName: 'Query', kind: 'OBJECT' };
       if (field.name === 'mutationType') return { __typename: '__Type', typeName: 'Mutation', kind: 'OBJECT' };
       if (field.name === 'subscriptionType') return null;
-      if (field.name === 'types') return [];
+      if (field.name === 'types') {
+        const names = [...Object.keys(FIELDS), ...Object.keys(ENUMS), ...Object.keys(INPUTS), 'String', 'Int', 'Float', 'Boolean', 'ID'];
+        return names.map((name) => typeObject(name)).filter((t): t is GqlObject => t !== null);
+      }
       if (field.name === 'directives') return [];
       break;
     }
@@ -1187,16 +1197,25 @@ function executeMutationField(exec: ExecContext, field: FieldNode): GqlObject {
       return { __typename: 'MergePullRequestPayload', pullRequest: pullObj(repo, pull), clientMutationId };
     }
     case 'addComment': {
-      const { repo, issue } = decodeIssueId(ctx, input.subjectId);
+      const parsed = parseGlobalId(input.subjectId);
+      let target: { repo: RepoRec; comments: CommentRec[]; subject: GqlObject; number: number; touch: () => void } | null = null;
+      if (parsed?.kind === 'Issue') {
+        const { repo, issue } = decodeIssueId(ctx, input.subjectId);
+        target = { repo, comments: issue.comments, subject: issueObj(repo, issue), number: issue.number, touch: () => { issue.updatedAt = ctx.nowIso; } };
+      } else if (parsed?.kind === 'PullRequest') {
+        const { repo, pull } = decodePullId(ctx, input.subjectId);
+        target = { repo, comments: pull.comments, subject: pullObj(repo, pull), number: pull.number, touch: () => { pull.updatedAt = ctx.nowIso; } };
+      }
+      if (!target) throw new GraphQLError('invalid subject id');
       const body = input.body;
       if (typeof body !== 'string' || !body) throw new GraphQLError('body is required');
-      repo.commentSeq += 1;
-      const comment = { id: repo.commentSeq, body, authorLogin: ctx.viewer.login, createdAt: ctx.nowIso, updatedAt: ctx.nowIso };
-      issue.comments.push(comment);
-      issue.updatedAt = ctx.nowIso;
+      target.repo.commentSeq += 1;
+      const comment = { id: target.repo.commentSeq, body, authorLogin: ctx.viewer.login, createdAt: ctx.nowIso, updatedAt: ctx.nowIso };
+      target.comments.push(comment);
+      target.touch();
       const node: GqlObject = {
         __typename: 'IssueComment',
-        commentGlobalId: globalId('IssueComment', repo.dbId, issue.number, comment.id),
+        commentGlobalId: globalId('IssueComment', target.repo.dbId, target.number, comment.id),
         body: comment.body,
         createdAt: comment.createdAt,
         updatedAt: comment.updatedAt,
@@ -1204,7 +1223,7 @@ function executeMutationField(exec: ExecContext, field: FieldNode): GqlObject {
       return {
         __typename: 'AddCommentPayload',
         commentEdge: { __typename: 'IssueCommentEdge', node, cursor: encodeCursor(`c:${comment.id}`) },
-        subject: issueObj(repo, issue),
+        subject: target.subject,
         clientMutationId,
       };
     }

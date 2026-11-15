@@ -127,23 +127,6 @@ export function parsePackets(buffer: Buffer, start = 0): { packets: Packet[]; ne
   }
 }
 
-/** Parse every pkt-line in a complete buffer (no raw tail expected). */
-export function parseAllPackets(buffer: Buffer): Packet[] {
-  const packets: Packet[] = [];
-  let offset = 0;
-  while (offset < buffer.length) {
-    const parsed = parsePackets(buffer, offset);
-    packets.push(...parsed.packets);
-    if (parsed.nextOffset === offset) throw new GitError('pkt-line parser made no progress', 'pkt-stuck');
-    offset = parsed.nextOffset;
-    // parsePackets stops after a flush; keep going only while bytes remain and the
-    // last packet was a flush that was not terminal for this framing (v2 requests
-    // end with a flush, so a trailing flush ends the loop naturally).
-    if (parsed.packets[parsed.packets.length - 1]?.kind === 'flush' && offset >= buffer.length) break;
-  }
-  return packets;
-}
-
 /** Split a sideband payload into band-1 packets of at most 65515 data bytes each. */
 export function sidebandPackets(band: number, data: Buffer): Buffer[] {
   const out: Buffer[] = [];
@@ -368,13 +351,19 @@ function readOfsDeltaBase(buffer: Buffer, start: number): { baseOffset: number; 
   return { baseOffset: value, next: offset };
 }
 
+/** Largest single object a pack may carry, inflated. Bounds decompression bombs: the 128MB body cap bounds input bytes, not expansion. */
+const MAX_OBJECT_BYTES = 32 * 1024 * 1024;
+
 /** Inflate one zlib stream at `offset`; returns its bytes and the offset just past the stream. */
 function inflateAt(buffer: Buffer, offset: number): { data: Buffer; next: number } {
   const view = buffer.subarray(offset);
   let result: { buffer: Buffer; engine: { bytesWritten: number } };
   try {
-    result = inflateSync(view, { info: true }) as unknown as { buffer: Buffer; engine: { bytesWritten: number } };
+    result = inflateSync(view, { info: true, maxOutputLength: MAX_OBJECT_BYTES }) as unknown as { buffer: Buffer; engine: { bytesWritten: number } };
   } catch (err) {
+    if ((err as { code?: unknown }).code === 'ERR_BUFFER_TOO_LARGE') {
+      throw new GitError(`zlib stream at offset ${offset} expands past the object size limit`, 'pack-size');
+    }
     throw new GitError(`zlib stream at offset ${offset} did not inflate: ${(err as Error).message}`, 'pack-zlib');
   }
   const written = result.engine.bytesWritten;
@@ -402,6 +391,9 @@ export function applyDelta(base: Uint8Array, delta: Uint8Array): Buffer {
   };
   const sourceSize = readSize();
   const targetSize = readSize();
+  if (targetSize > MAX_OBJECT_BYTES) {
+    throw new GitError('delta target size exceeds the object size limit', 'delta-size');
+  }
   if (sourceSize !== baseBuffer.length) {
     throw new GitError(`delta expects a ${sourceSize}-byte base, got ${baseBuffer.length}`, 'delta-base-size');
   }
@@ -496,6 +488,9 @@ export function readPack(pack: Uint8Array, options: { resolveBase?: ObjectLookup
     const entryOffset = offset;
     const header = readVarintSize(buffer, offset);
     offset = header.next;
+    if (header.size > MAX_OBJECT_BYTES) {
+      throw new GitError('pack entry declares an object over the size limit', 'pack-size');
+    }
     const typeCode = (header.first >> 4) & 0x07;
     const entry: RawEntry = { offset: entryOffset, typeCode, size: header.size, data: Buffer.alloc(0) };
     if (typeCode === 6) {
@@ -780,10 +775,218 @@ export function diffTrees(
  * Three-way merge of flat trees. Returns the merged map, or the conflicting paths
  * when both sides changed the same path differently.
  */
+/** Blob access a line-level merge needs: read blobs, and store (or hash) a merged blob. */
+export interface MergeBlobAccess {
+  readonly lookup: ObjectLookup;
+  readonly put: (type: GitObjectType, data: Uint8Array) => string;
+}
+
+/** LCS table cap for a merge diff (cells); larger files fall back to a path-level conflict. */
+const MERGE_LCS_CELL_CAP = 4000000;
+
+/** A maximal run of changed lines: base [baseStart, baseEnd) replaced by `replacement`. */
+interface DiffHunk {
+  readonly baseStart: number;
+  readonly baseEnd: number;
+  /** Offset just past the hunk in the side's lines (for trailing-newline tracking). */
+  readonly sideEnd: number;
+  readonly replacement: string[];
+}
+
+/** LCS-diff hunks from `baseLines` to `sideLines`; null when the table exceeds the merge cap. */
+function diffHunks(baseLines: readonly string[], sideLines: readonly string[]): DiffHunk[] | null {
+  const n = baseLines.length;
+  const m = sideLines.length;
+  if (n * m > MERGE_LCS_CELL_CAP) return null;
+  const width = m + 1;
+  const dp = new Uint32Array((n + 1) * width);
+  for (let i = 1; i <= n; i += 1) {
+    for (let j = 1; j <= m; j += 1) {
+      dp[i * width + j] = baseLines[i - 1] === sideLines[j - 1]
+        ? dp[(i - 1) * width + (j - 1)] + 1
+        : Math.max(dp[(i - 1) * width + j], dp[i * width + (j - 1)]);
+    }
+  }
+  type Op = { kind: 'match' | 'del' | 'ins'; line: string };
+  const ops: Op[] = [];
+  let i = n;
+  let j = m;
+  while (i > 0 || j > 0) {
+    if (i > 0 && j > 0 && baseLines[i - 1] === sideLines[j - 1]) {
+      ops.push({ kind: 'match', line: baseLines[i - 1] });
+      i -= 1;
+      j -= 1;
+    } else if (j > 0 && (i === 0 || dp[i * width + (j - 1)] > dp[(i - 1) * width + j])) {
+      ops.push({ kind: 'ins', line: sideLines[j - 1] });
+      j -= 1;
+    } else {
+      ops.push({ kind: 'del', line: baseLines[i - 1] });
+      i -= 1;
+    }
+  }
+  ops.reverse();
+  const hunks: DiffHunk[] = [];
+  let basePos = 0;
+  let sidePos = 0;
+  let k = 0;
+  while (k < ops.length) {
+    if (ops[k].kind === 'match') {
+      basePos += 1;
+      sidePos += 1;
+      k += 1;
+      continue;
+    }
+    const baseStart = basePos;
+    const replacement: string[] = [];
+    while (k < ops.length && ops[k].kind !== 'match') {
+      if (ops[k].kind === 'del') basePos += 1;
+      else {
+        replacement.push(ops[k].line);
+        sidePos += 1;
+      }
+      k += 1;
+    }
+    hunks.push({ baseStart, baseEnd: basePos, sideEnd: sidePos, replacement });
+  }
+  return hunks;
+}
+
+function sameLines(a: readonly string[], b: readonly string[]): boolean {
+  return a.length === b.length && a.every((line, index) => line === b[index]);
+}
+
+interface MergeSideInput {
+  readonly lines: readonly string[];
+  readonly endsWithNewline: boolean;
+  readonly hunks: DiffHunk[];
+}
+
+/**
+ * Three-way line merge (diff3 semantics, git's adjacency rule): disjoint hunks
+ * combine, overlapping or touching hunks conflict (changes need at least one
+ * unchanged line between them), same-position insertions with differing
+ * content conflict. Null on conflict.
+ */
+function mergeLines(
+  baseLines: readonly string[],
+  baseEndsWithNewline: boolean,
+  ours: MergeSideInput,
+  theirs: MergeSideInput,
+): { lines: string[]; endsWithNewline: boolean } | null {
+  const out: string[] = [];
+  let lastTerminator = baseEndsWithNewline;
+  let pos = 0;
+  let io = 0;
+  let it = 0;
+  const emitUnchanged = (to: number): void => {
+    if (to <= pos) return;
+    for (; pos < to; pos += 1) out.push(baseLines[pos]);
+    lastTerminator = pos === baseLines.length ? baseEndsWithNewline : true;
+  };
+  const emitHunk = (side: MergeSideInput, hunk: DiffHunk): void => {
+    if (hunk.replacement.length === 0) return;
+    out.push(...hunk.replacement);
+    lastTerminator = hunk.sideEnd === side.lines.length ? side.endsWithNewline : true;
+  };
+  while (io < ours.hunks.length || it < theirs.hunks.length) {
+    const ho = ours.hunks[io];
+    const ht = theirs.hunks[it];
+    if (ho && ht && ho.baseStart === ht.baseStart) {
+      const oIns = ho.baseStart === ho.baseEnd;
+      const tIns = ht.baseStart === ht.baseEnd;
+      emitUnchanged(ho.baseStart);
+      if (oIns && tIns) {
+        if (!sameLines(ho.replacement, ht.replacement)) return null;
+        emitHunk(ours, ho);
+        io += 1;
+        it += 1;
+        continue;
+      }
+      // An insertion touching a change hunk (at either boundary) conflicts,
+      // matching git: changes need at least one unchanged line between them.
+      if (oIns || tIns) return null;
+      if (ho.baseEnd === ht.baseEnd && sameLines(ho.replacement, ht.replacement)) {
+        emitHunk(ours, ho);
+        pos = ho.baseEnd;
+        io += 1;
+        it += 1;
+        continue;
+      }
+      return null;
+    }
+    const takeOurs = ho && (!ht || ho.baseStart < ht.baseStart);
+    const hunk = takeOurs ? ho : ht;
+    const side = takeOurs ? ours : theirs;
+    const other = takeOurs ? ht : ho;
+    if (!hunk) break;
+    const isIns = hunk.baseStart === hunk.baseEnd;
+    // Touching counts as overlapping: a change ending exactly where the other
+    // side's hunk starts still conflicts (no unchanged line between them).
+    if (!isIns && other && hunk.baseEnd >= other.baseStart) return null;
+    emitUnchanged(hunk.baseStart);
+    emitHunk(side, hunk);
+    if (!isIns) pos = hunk.baseEnd;
+    if (takeOurs) io += 1;
+    else it += 1;
+  }
+  emitUnchanged(baseLines.length);
+  return { lines: out, endsWithNewline: out.length ? lastTerminator : baseEndsWithNewline };
+}
+
+/** git's binary heuristic: a NUL byte in the first 8000 bytes. */
+function isBinaryBlob(data: Buffer): boolean {
+  const scan = Math.min(data.length, 8000);
+  for (let i = 0; i < scan; i += 1) if (data[i] === 0) return true;
+  return false;
+}
+
+/** Line-merge one path present in all three trees; null when it conflicts or is not mergeable. */
+function lineMergeEntry(
+  b: FlatEntry,
+  o: FlatEntry,
+  t: FlatEntry,
+  blobs: MergeBlobAccess,
+): FlatEntry | null {
+  const bObj = blobs.lookup(b.oid);
+  const oObj = blobs.lookup(o.oid);
+  const tObj = blobs.lookup(t.oid);
+  if (!bObj || !oObj || !tObj) return null;
+  if (bObj.type !== 'blob' || oObj.type !== 'blob' || tObj.type !== 'blob') return null;
+  if (isBinaryBlob(bObj.data) || isBinaryBlob(oObj.data) || isBinaryBlob(tObj.data)) return null;
+  let mode: string;
+  if (o.mode === t.mode) mode = o.mode;
+  else if (o.mode === b.mode) mode = t.mode;
+  else if (t.mode === b.mode) mode = o.mode;
+  else return null;
+  const bText = bObj.data.toString('utf8');
+  const oText = oObj.data.toString('utf8');
+  const tText = tObj.data.toString('utf8');
+  if (oText === tText) return { oid: o.oid, mode };
+  const baseLines = splitLines(bText);
+  const oLines = splitLines(oText);
+  const tLines = splitLines(tText);
+  const oursHunks = diffHunks(baseLines, oLines);
+  const theirsHunks = diffHunks(baseLines, tLines);
+  if (!oursHunks || !theirsHunks) return null;
+  const merged = mergeLines(
+    baseLines,
+    bText.endsWith('\n'),
+    { lines: oLines, endsWithNewline: oText.endsWith('\n'), hunks: oursHunks },
+    { lines: tLines, endsWithNewline: tText.endsWith('\n'), hunks: theirsHunks },
+  );
+  if (!merged) return null;
+  const text = merged.lines.length === 0 ? '' : merged.lines.join('\n') + (merged.endsWithNewline ? '\n' : '');
+  const data = Buffer.from(text, 'utf8');
+  if (data.equals(oObj.data)) return { oid: o.oid, mode };
+  if (data.equals(tObj.data)) return { oid: t.oid, mode };
+  return { oid: blobs.put('blob', data), mode };
+}
+
 export function threeWayMerge(
   base: ReadonlyMap<string, FlatEntry>,
   ours: ReadonlyMap<string, FlatEntry>,
   theirs: ReadonlyMap<string, FlatEntry>,
+  blobs?: MergeBlobAccess,
 ): { merged: Map<string, FlatEntry> | null; conflicts: string[] } {
   const same = (x: FlatEntry | undefined, y: FlatEntry | undefined): boolean =>
     x === undefined ? y === undefined : y !== undefined && x.oid === y.oid && x.mode === y.mode;
@@ -799,6 +1002,11 @@ export function threeWayMerge(
     else if (same(o, b)) winner = t;
     else if (same(t, b)) winner = o;
     else {
+      const lineMerged = blobs && b && o && t ? lineMergeEntry(b, o, t, blobs) : null;
+      if (lineMerged) {
+        merged.set(path, lineMerged);
+        continue;
+      }
       conflicts.push(path);
       continue;
     }

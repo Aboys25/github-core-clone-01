@@ -9,7 +9,7 @@
 
 import { DomainError, createIssueRecord, createPullRecord, mergePullRecord } from './store.ts';
 import type { RepoRec } from './store.ts';
-import { globalId, isRecord } from './util.ts';
+import { globalId, isRecord, isValidRepoName } from './util.ts';
 import type { ForgeContext } from './app-types.ts';
 
 const SERVER_NAME = 'github-core-clone-forge';
@@ -144,6 +144,7 @@ function callTool(ctx: ForgeContext, name: string, args: Record<string, unknown>
     case 'create_repo': {
       const repoName = args.name;
       if (typeof repoName !== 'string' || !repoName) return { value: 'name is required', isError: true };
+      if (!isValidRepoName(repoName)) return { value: 'name is invalid', isError: true };
       const repo = ctx.store.createRepo(ctx.viewer.login, repoName, {
         description: typeof args.description === 'string' ? args.description : null,
         isPrivate: args.private === true,
